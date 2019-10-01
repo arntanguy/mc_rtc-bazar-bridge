@@ -1,0 +1,1 @@
+set(mc_rtc-bazar-bridge_PID_VERSION 3 CACHE INTERNAL "")

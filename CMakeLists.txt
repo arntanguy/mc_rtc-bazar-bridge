@@ -6,13 +6,17 @@ include(Package_Definition NO_POLICY_SCOPE)
 project(mc_rtc-bazar-bridge)
 
 PID_Package(
-			AUTHOR      idhuser
-			YEAR        2019
-			LICENSE     CeCILL
-			DESCRIPTION TODO: input a short description of package mc_rtc-bazar-bridge utility here
-			VERSION     0.1.0
-		)
+	AUTHOR      Benjamin Navarro
+	YEAR        2019
+	LICENSE     BSD
+	DESCRIPTION Bridge to make mc_rtc talk to the BAZAR robot
+	ADDRESS 	git@gite.lirmm.fr:cobot/mc_rtc-bazar-bridge.git
+	CODE_STYLE	pid11
+	VERSION     0.1.0
+)
 
-#now finding packages
+PID_Dependency(api-driver-fri)
+PID_Dependency(ati-force-sensor-driver)
+PID_Dependency(pid-os-utilities)
 
 build_PID_Package()
