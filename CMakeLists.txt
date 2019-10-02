@@ -18,5 +18,9 @@ PID_Package(
 PID_Dependency(api-driver-fri)
 PID_Dependency(ati-force-sensor-driver)
 PID_Dependency(pid-os-utilities)
+PID_Dependency(cli11)
+
+set(CMAKE_CXX_STANDARD 11)
+find_package(mc_udp REQUIRED)
 
 build_PID_Package()
