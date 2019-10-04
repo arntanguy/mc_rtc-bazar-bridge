@@ -1,6 +1,8 @@
 #include <fri/kuka_lwr_driver.h>
 #include <fri/kuka_lwr_robot.h>
 #include <ati/force_sensor_driver.h>
+#include <mpo700/MPO700interface.h>
+#include <flir/driver.h>
 
 #include <mc_udp/logging.h>
 #include <mc_udp/server/Server.h>
@@ -11,15 +13,20 @@
 
 #include <iostream>
 #include <chrono>
+#include <thread>
+#include <memory>
 #include <unistd.h>
 
 int main(int argc, const char** argv) {
     CLI::App app{"mc_rtc-bazar-bridge"};
 
     int port{4444};
-    double cycle_time_s{0.005}; // Can be set between 1 and 20ms
-    int left_arm_port{49938};   // local UDP port (see KRC configuration)
-    int right_arm_port{49939};  // local UDP port (see KRC configuration)
+    double cycle_time_s{0.005};        // Can be set between 1 and 20ms
+    int left_arm_port{49938};          // local UDP port (see KRC configuration)
+    int right_arm_port{49939};         // local UDP port (see KRC configuration)
+    int mobile_base_local_port{22211}; // local UDP port
+    int mobile_base_robot_port{22221}; // remote UDP port
+    bool enable_mobile_base{false};
 
     std::string left_ft_serial{"FT07321"};
     std::string right_ft_serial{"FT21001"};
@@ -46,6 +53,8 @@ int main(int argc, const char** argv) {
                "The right force/torque sensor serial number");
     add_option("ft_cutoff_freq", cutoff_freq_hz,
                "The force/torque sensors cutoff frequency in Hertz");
+    add_option("enable_mobile_base", enable_mobile_base,
+               "Enable control of the mobile base");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -61,8 +70,10 @@ int main(int argc, const char** argv) {
     const size_t bazar_joint_count{base_joint_count + 2 * arm_joint_count +
                                    pan_tilt_joint_count};
 
-    mc_udp::Server server(port);
-    auto& sensors = server.sensors();
+    mc_udp::Server server_sensor{port};
+    mc_udp::Server server_control{port + 1};
+    auto& sensors = server_sensor.sensors();
+    const auto& control = server_control.control();
     sensors.encoders.resize(bazar_joint_count);
     sensors.torques.resize(bazar_joint_count);
 
@@ -80,8 +91,12 @@ int main(int argc, const char** argv) {
     zero_array(sensors.orientation);
     zero_array(sensors.angularVelocity);
     zero_array(sensors.angularAcceleration);
+    zero_array(sensors.floatingBasePos);
+    zero_array(sensors.floatingBaseRPY);
+    zero_array(sensors.floatingBaseVel);
+    zero_array(sensors.floatingBaseAcc);
 
-    server.sensors().id = 0;
+    server_sensor.sensors().id = 0;
 
     fri::KukaLWRRobot left_arm{};
     fri::KukaLWRRobot right_arm{};
@@ -104,6 +119,19 @@ int main(int argc, const char** argv) {
                            // to 25kHz)
         cutoff_freq_hz};   // Filter cutoff frequency, <0 to disable it (applies
                            // to the 25kHz data)
+
+    mpo700::MPO700CartesianState mobile_base_state;
+    mpo700::MPO700CartesianVelocity mobile_base_command;
+
+    std::optional<mpo700::MPO700Interface> mobile_base_driver;
+    if (enable_mobile_base) {
+        mobile_base_driver = mpo700::MPO700Interface("enp4s0f1", "192.168.0.1",
+                                                     mobile_base_local_port,
+                                                     mobile_base_robot_port);
+    }
+
+    flir::PanTilt ptu;
+    flir::Driver pan_tilt_driver(ptu, "tcp:192.168.0.101");
 
     dual_force_sensor_driver.readOffsets(
         "ati_offset_files/" + left_ft_serial + ".yaml", 0);
@@ -131,6 +159,26 @@ int main(int argc, const char** argv) {
         std::exit(-1);
     }
 
+    if (mobile_base_driver and not mobile_base_driver->init()) {
+        std::cerr << "Failed to initialize the mobile base driver" << std::endl;
+        std::exit(-1);
+    }
+
+    if (mobile_base_driver and
+        not mobile_base_driver->enter_Cartesian_Command_Mode()) {
+        std::cerr << "Cannot switch the mobile base to cartesian control"
+                  << std::endl;
+        std::exit(-1);
+    }
+
+    if (not pan_tilt_driver.start(flir::CommandMode::Position)) {
+        std::cerr << "Failed to initialize the pan/tilt driver" << std::endl;
+        std::exit(-1);
+    } else {
+        pan_tilt_driver.sync();
+        pan_tilt_driver.read();
+    }
+
     auto set_wrench = [&](const std::string& name, const ati::Wrench& wrench) {
         std::array<double, 6> ft_values{};
         std::copy_n(wrench.forces.data(), 3, begin(ft_values));
@@ -144,6 +192,9 @@ int main(int argc, const char** argv) {
         size_t offset{0};
 
         fill_n(begin(sensors.encoders) + offset, base_joint_count, 0.);
+        sensors.floatingBasePos[0] = mobile_base_state.velocity.x_vel;
+        sensors.floatingBasePos[1] = mobile_base_state.velocity.y_vel;
+        sensors.floatingBaseRPY[2] = mobile_base_state.velocity.rot_vel;
         offset += base_joint_count;
 
         copy_n(left_arm.state.joint_position.data(), arm_joint_count,
@@ -154,28 +205,37 @@ int main(int argc, const char** argv) {
                begin(sensors.encoders) + offset);
         offset += arm_joint_count;
 
-        fill_n(begin(sensors.encoders) + offset, pan_tilt_joint_count, 0.);
+        sensors.encoders[offset] = ptu.state.position.pan;
+        sensors.encoders[offset + 1] = ptu.state.position.tilt;
 
         set_wrench("lhsensor", left_wrench);
         set_wrench("rhsensor", right_wrench);
 
-        server.send();
+        server_sensor.recv();
+        server_sensor.send();
     };
 
     auto read_commands = [&]() {
-        if (server.recv()) {
-            const auto& control = server.control();
+        server_control.send();
+        if (server_control.recv()) {
             if (control.id != sensors.id) {
                 MC_UDP_WARNING("[BAZAR] Server control id "
-                               << server.control().id
-                               << " does not match sensors id "
-                               << server.sensors().id)
+                               << control.id << " does not match sensors id "
+                               << sensors.id)
             } else {
                 using namespace std;
 
                 size_t offset{0};
 
-                // TODO send base commands
+                for (auto v : control.encoders) {
+                    std::cout << v << ' ';
+                }
+                std::cout << std::endl;
+
+                // TODO wait for control.velocity to be implemented
+                // mobile_base_command.x_vel = control.encoders[0];
+                // mobile_base_command.y_vel = control.encoders[1];
+                // mobile_base_command.rot_vel = control.encoders[2];
                 offset += base_joint_count;
 
                 copy_n(begin(control.encoders) + offset, arm_joint_count,
@@ -186,11 +246,25 @@ int main(int argc, const char** argv) {
                        right_arm.command.joint_position.data());
                 offset += arm_joint_count;
 
-                // TODO send pan tilt commands
+                ptu.command.position.pan = control.encoders[offset];
+                ptu.command.position.tilt = control.encoders[offset + 1];
+
+                sensors.id++;
             }
         }
-        server.sensors().id += 1;
     };
+
+    std::thread mobile_base_reception_thread;
+    if (mobile_base_driver) {
+        mobile_base_reception_thread = std::thread([&]() {
+            mobile_base_driver->consult_State(true);
+            while (mobile_base_driver->update_State()) {
+                continue;
+            }
+            std::cerr << "Failed to update state from the mobile base"
+                      << std::endl;
+        });
+    }
 
     bool stop{false};
     pid::SignalManager::registerCallback(
@@ -199,6 +273,12 @@ int main(int argc, const char** argv) {
 
     left_arm.command.joint_position = left_arm.state.joint_position;
     right_arm.command.joint_position = right_arm.state.joint_position;
+    mobile_base_command.x_vel = 0;
+    mobile_base_command.y_vel = 0;
+    mobile_base_command.rot_vel = 0;
+    ptu.command.position.pan = ptu.state.position.pan;
+    ptu.command.position.tilt = ptu.state.position.tilt;
+    ptu.command.velocity = ptu.limits.max_velocity;
 
     while (not stop) {
         left_arm_driver.wait_For_KRC_Tick(); // Wait for synchronization signal
@@ -206,27 +286,38 @@ int main(int argc, const char** argv) {
         left_arm_driver.get_Data();
         right_arm_driver.get_Data();
         dual_force_sensor_driver.process();
+        if (mobile_base_driver) {
+            mobile_base_driver->get_Cartesian_State(mobile_base_state);
+        }
+        pan_tilt_driver.read();
 
         send_state();
 
-        std::cout << "---------------------------------------\n";
-        std::cout << "Left arm:\n";
-        std::cout << "\tposition: ";
-        std::cout << left_arm.state.joint_position.transpose() << '\n';
-        std::cout << "\twrench: ";
-        std::cout << left_wrench << '\n';
+        // std::cout << "---------------------------------------\n";
+        // std::cout << "Left arm:\n";
+        // std::cout << "\tposition: ";
+        // std::cout << left_arm.state.joint_position.transpose() << '\n';
+        // std::cout << "\twrench: ";
+        // std::cout << left_wrench << '\n';
 
-        std::cout << "Right arm:\n";
-        std::cout << "\tposition: ";
-        std::cout << right_arm.state.joint_position.transpose() << '\n';
-        std::cout << "\twrench: ";
-        std::cout << right_wrench << '\n';
+        // std::cout << "Right arm:\n";
+        // std::cout << "\tposition: ";
+        // std::cout << right_arm.state.joint_position.transpose() << '\n';
+        // std::cout << "\twrench: ";
+        // std::cout << right_wrench << '\n';
 
         read_commands();
 
         left_arm_driver.send_Data();
         right_arm_driver.send_Data();
+        if (mobile_base_driver) {
+            mobile_base_driver->set_Cartesian_Command(mobile_base_command);
+        }
+        pan_tilt_driver.send();
     }
+
+    pid::SignalManager::unregisterCallback(pid::SignalManager::Interrupt,
+                                           "stop");
 
     if (not dual_force_sensor_driver.end()) {
         std::cerr << "Failed to stop the F/T arm driver" << std::endl;
@@ -238,5 +329,18 @@ int main(int argc, const char** argv) {
 
     if (not right_arm_driver.end()) {
         std::cerr << "Failed to stop the right arm driver" << std::endl;
+    }
+
+    if (mobile_base_driver) {
+        mobile_base_driver->exit_Command_Mode();
+        mobile_base_driver->consult_State(false);
+        if (mobile_base_reception_thread.joinable()) {
+            mobile_base_reception_thread.join();
+        }
+        mobile_base_driver->end();
+    }
+
+    if (not pan_tilt_driver.stop()) {
+        std::cerr << "Failed to stop the pan/tilt driver" << std::endl;
     }
 }

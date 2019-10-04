@@ -17,6 +17,8 @@ PID_Package(
 
 PID_Dependency(api-driver-fri)
 PID_Dependency(ati-force-sensor-driver)
+PID_Dependency(neobotix-mpo700-udp-interface)
+PID_Dependency(flir-sdk)
 PID_Dependency(pid-os-utilities)
 PID_Dependency(cli11)
 
