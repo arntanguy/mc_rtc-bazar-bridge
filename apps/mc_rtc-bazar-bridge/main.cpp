@@ -27,6 +27,8 @@ int main(int argc, const char** argv) {
     int mobile_base_local_port{22211}; // local UDP port
     int mobile_base_robot_port{22221}; // remote UDP port
     bool enable_mobile_base{false};
+    std::string mobile_base_network_interface{"enp4s0f1"};
+    std::string mobile_base_ip{"192.168.0.1"};
 
     std::string left_ft_serial{"FT07321"};
     std::string right_ft_serial{"FT21001"};
@@ -75,6 +77,7 @@ int main(int argc, const char** argv) {
     auto& sensors = server_sensor.sensors();
     const auto& control = server_control.control();
     sensors.encoders.resize(bazar_joint_count);
+    sensors.encoderVelocities.resize(bazar_joint_count);
     sensors.torques.resize(bazar_joint_count);
 
     auto zero_array = [](auto& array) {
@@ -98,6 +101,45 @@ int main(int argc, const char** argv) {
 
     server_sensor.sensors().id = 0;
 
+    mpo700::MPO700CartesianState mobile_base_state;
+    mpo700::MPO700CartesianVelocity mobile_base_command;
+
+    std::optional<mpo700::MPO700Interface> mobile_base_driver;
+    std::thread mobile_base_reception_thread;
+    bool stop_mobile_base_reception_thread{false};
+
+    if (enable_mobile_base) {
+        mobile_base_driver.emplace(mobile_base_network_interface,
+                                   mobile_base_ip, mobile_base_local_port,
+                                   mobile_base_robot_port);
+
+        if (not mobile_base_driver->init()) {
+            std::cerr << "Failed to initialize the mobile base driver"
+                      << std::endl;
+            std::exit(-1);
+        }
+
+        mobile_base_reception_thread = std::thread([&]() {
+            while (mobile_base_driver->update_State() and
+                   not stop_mobile_base_reception_thread) {
+                continue;
+            }
+            if (not stop_mobile_base_reception_thread) {
+                std::cerr << "Failed to update state from the mobile base"
+                          << std::endl;
+            }
+        });
+
+        mobile_base_driver->consult_State(true);
+        mobile_base_driver->exit_Command_Mode();
+
+        if (not mobile_base_driver->enter_Cartesian_Command_Mode()) {
+            std::cerr << "Cannot switch the mobile base to cartesian control"
+                      << std::endl;
+            std::exit(-1);
+        }
+    }
+
     fri::KukaLWRRobot left_arm{};
     fri::KukaLWRRobot right_arm{};
 
@@ -119,16 +161,6 @@ int main(int argc, const char** argv) {
                            // to 25kHz)
         cutoff_freq_hz};   // Filter cutoff frequency, <0 to disable it (applies
                            // to the 25kHz data)
-
-    mpo700::MPO700CartesianState mobile_base_state;
-    mpo700::MPO700CartesianVelocity mobile_base_command;
-
-    std::optional<mpo700::MPO700Interface> mobile_base_driver;
-    if (enable_mobile_base) {
-        mobile_base_driver = mpo700::MPO700Interface("enp4s0f1", "192.168.0.1",
-                                                     mobile_base_local_port,
-                                                     mobile_base_robot_port);
-    }
 
     flir::PanTilt ptu;
     flir::Driver pan_tilt_driver(ptu, "tcp:192.168.0.101");
@@ -156,18 +188,6 @@ int main(int argc, const char** argv) {
 
     if (not right_arm_driver.init()) {
         std::cerr << "Failed to initialize the right arm driver" << std::endl;
-        std::exit(-1);
-    }
-
-    if (mobile_base_driver and not mobile_base_driver->init()) {
-        std::cerr << "Failed to initialize the mobile base driver" << std::endl;
-        std::exit(-1);
-    }
-
-    if (mobile_base_driver and
-        not mobile_base_driver->enter_Cartesian_Command_Mode()) {
-        std::cerr << "Cannot switch the mobile base to cartesian control"
-                  << std::endl;
         std::exit(-1);
     }
 
@@ -218,53 +238,46 @@ int main(int argc, const char** argv) {
     auto read_commands = [&]() {
         server_control.send();
         if (server_control.recv()) {
-            if (control.id != sensors.id) {
-                MC_UDP_WARNING("[BAZAR] Server control id "
-                               << control.id << " does not match sensors id "
-                               << sensors.id)
-            } else {
-                using namespace std;
+            // if (control.id != sensors.id) {
+            //     MC_UDP_WARNING("[BAZAR] Server control id "
+            //                    << control.id << " does not match sensors id "
+            //                    << sensors.id)
+            // } else {
+            using namespace std;
 
-                size_t offset{0};
+            size_t offset{0};
 
-                for (auto v : control.encoders) {
-                    std::cout << v << ' ';
+            // Threhold on the mobile base velocities to avoid unnecessary
+            // repositionning of the wheels
+            auto threshold = [](auto value) {
+                if (std::abs(value) < 1e-6) {
+                    return 0.;
+                } else {
+                    return value;
                 }
-                std::cout << std::endl;
+            };
 
-                // TODO wait for control.velocity to be implemented
-                // mobile_base_command.x_vel = control.encoders[0];
-                // mobile_base_command.y_vel = control.encoders[1];
-                // mobile_base_command.rot_vel = control.encoders[2];
-                offset += base_joint_count;
+            const auto& velocities = control.encoderVelocities;
+            mobile_base_command.x_vel = threshold(velocities[0]);
+            mobile_base_command.y_vel = threshold(velocities[1]);
+            mobile_base_command.rot_vel = threshold(velocities[2]);
+            offset += base_joint_count;
 
-                copy_n(begin(control.encoders) + offset, arm_joint_count,
-                       left_arm.command.joint_position.data());
-                offset += arm_joint_count;
+            copy_n(begin(control.encoders) + offset, arm_joint_count,
+                   left_arm.command.joint_position.data());
+            offset += arm_joint_count;
 
-                copy_n(begin(control.encoders) + offset, arm_joint_count,
-                       right_arm.command.joint_position.data());
-                offset += arm_joint_count;
+            copy_n(begin(control.encoders) + offset, arm_joint_count,
+                   right_arm.command.joint_position.data());
+            offset += arm_joint_count;
 
-                ptu.command.position.pan = control.encoders[offset];
-                ptu.command.position.tilt = control.encoders[offset + 1];
+            ptu.command.position.pan = control.encoders[offset];
+            ptu.command.position.tilt = control.encoders[offset + 1];
 
-                sensors.id++;
-            }
+            sensors.id++;
         }
+        // }
     };
-
-    std::thread mobile_base_reception_thread;
-    if (mobile_base_driver) {
-        mobile_base_reception_thread = std::thread([&]() {
-            mobile_base_driver->consult_State(true);
-            while (mobile_base_driver->update_State()) {
-                continue;
-            }
-            std::cerr << "Failed to update state from the mobile base"
-                      << std::endl;
-        });
-    }
 
     bool stop{false};
     pid::SignalManager::registerCallback(
@@ -281,39 +294,39 @@ int main(int argc, const char** argv) {
     ptu.command.velocity = ptu.limits.max_velocity;
 
     while (not stop) {
+        bool all_ok = true;
         left_arm_driver.wait_For_KRC_Tick(); // Wait for synchronization signal
 
-        left_arm_driver.get_Data();
-        right_arm_driver.get_Data();
-        dual_force_sensor_driver.process();
+        all_ok &= left_arm_driver.get_Data();
+        all_ok &= right_arm_driver.get_Data();
+        all_ok &= dual_force_sensor_driver.process();
         if (mobile_base_driver) {
             mobile_base_driver->get_Cartesian_State(mobile_base_state);
         }
-        pan_tilt_driver.read();
+        all_ok &= pan_tilt_driver.read();
+
+        if (not all_ok) {
+            std::cerr << "Failed to update the state from the robot"
+                      << std::endl;
+            break;
+        }
 
         send_state();
 
-        // std::cout << "---------------------------------------\n";
-        // std::cout << "Left arm:\n";
-        // std::cout << "\tposition: ";
-        // std::cout << left_arm.state.joint_position.transpose() << '\n';
-        // std::cout << "\twrench: ";
-        // std::cout << left_wrench << '\n';
-
-        // std::cout << "Right arm:\n";
-        // std::cout << "\tposition: ";
-        // std::cout << right_arm.state.joint_position.transpose() << '\n';
-        // std::cout << "\twrench: ";
-        // std::cout << right_wrench << '\n';
-
         read_commands();
 
-        left_arm_driver.send_Data();
-        right_arm_driver.send_Data();
+        all_ok &= left_arm_driver.send_Data();
+        all_ok &= right_arm_driver.send_Data();
         if (mobile_base_driver) {
-            mobile_base_driver->set_Cartesian_Command(mobile_base_command);
+            all_ok &=
+                mobile_base_driver->set_Cartesian_Command(mobile_base_command);
         }
-        pan_tilt_driver.send();
+        all_ok &= pan_tilt_driver.send();
+
+        if (not all_ok) {
+            std::cerr << "Failed to send commands the robot" << std::endl;
+            break;
+        }
     }
 
     pid::SignalManager::unregisterCallback(pid::SignalManager::Interrupt,
@@ -332,11 +345,18 @@ int main(int argc, const char** argv) {
     }
 
     if (mobile_base_driver) {
-        mobile_base_driver->exit_Command_Mode();
-        mobile_base_driver->consult_State(false);
+        mobile_base_command.x_vel = 0.;
+        mobile_base_command.y_vel = 0.;
+        mobile_base_command.rot_vel = 0.;
+        mobile_base_driver->set_Cartesian_Command(mobile_base_command);
+
         if (mobile_base_reception_thread.joinable()) {
+            stop_mobile_base_reception_thread = true;
             mobile_base_reception_thread.join();
         }
+
+        mobile_base_driver->exit_Command_Mode();
+        mobile_base_driver->consult_State(false);
         mobile_base_driver->end();
     }
 
