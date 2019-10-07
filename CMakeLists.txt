@@ -16,12 +16,12 @@ PID_Package(
 	VERSION     0.1.0
 )
 
-PID_Dependency(api-driver-fri)
-PID_Dependency(ati-force-sensor-driver)
-PID_Dependency(neobotix-mpo700-udp-interface)
-PID_Dependency(flir-sdk)
-PID_Dependency(pid-os-utilities)
-PID_Dependency(cli11)
+PID_Dependency(api-driver-fri VERSION 1.5.0)
+PID_Dependency(ati-force-sensor-driver VERSION 1.1.4)
+PID_Dependency(neobotix-mpo700-udp-interface VERSION 1.0.1)
+PID_Dependency(flir-sdk VERSION 1.3.0)
+PID_Dependency(pid-os-utilities VERSION 2.1.1)
+PID_Dependency(cli11 VERSION 1.8)
 
 set(CMAKE_CXX_STANDARD 11)
 find_package(mc_udp REQUIRED)
