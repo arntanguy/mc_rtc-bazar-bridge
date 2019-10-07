@@ -11,6 +11,7 @@ PID_Package(
 	LICENSE     BSD
 	DESCRIPTION Bridge to make mc_rtc talk to the BAZAR robot
 	ADDRESS 	git@gite.lirmm.fr:cobot/mc_rtc-bazar-bridge.git
+	README 		instructions.md
 	CODE_STYLE	pid11
 	VERSION     0.1.0
 )
