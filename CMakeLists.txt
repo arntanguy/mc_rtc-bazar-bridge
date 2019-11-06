@@ -13,7 +13,7 @@ PID_Package(
 	ADDRESS 	git@gite.lirmm.fr:cobot/mc_rtc-bazar-bridge.git
 	README 		instructions.md
 	CODE_STYLE	pid11
-	VERSION     0.2.0
+	VERSION     0.1.1
 )
 
 PID_Dependency(api-driver-fri VERSION 1.5.0)
