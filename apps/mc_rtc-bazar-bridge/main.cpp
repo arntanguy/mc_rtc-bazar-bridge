@@ -258,9 +258,17 @@ int main(int argc, const char** argv) {
             };
 
             const auto& velocities = control.encoderVelocities;
-            mobile_base_command.x_vel = threshold(velocities[0]);
-            mobile_base_command.y_vel = threshold(velocities[1]);
-            mobile_base_command.rot_vel = threshold(velocities[2]);
+            // The udp client won't send joint velocities if not explicitely
+            // asked to
+            if (not velocities.empty()) {
+                mobile_base_command.x_vel = threshold(velocities[0]);
+                mobile_base_command.y_vel = threshold(velocities[1]);
+                mobile_base_command.rot_vel = threshold(velocities[2]);
+            } else {
+                mobile_base_command.x_vel = 0.;
+                mobile_base_command.y_vel = 0.;
+                mobile_base_command.rot_vel = 0.;
+            }
             offset += base_joint_count;
 
             copy_n(begin(control.encoders) + offset, arm_joint_count,
