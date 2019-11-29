@@ -77,7 +77,7 @@ int main(int argc, const char** argv) {
     auto& sensors = server_sensor.sensors();
     const auto& control = server_control.control();
     sensors.encoders.resize(bazar_joint_count);
-    sensors.encoderVelocities.resize(bazar_joint_count);
+    sensors.encoderVelocities.resize(0); // no velocity feedback at the moment
     sensors.torques.resize(bazar_joint_count);
 
     auto zero_array = [](auto& array) {
